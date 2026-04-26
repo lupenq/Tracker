@@ -12,16 +12,28 @@ final class CreateTrackerViewController: UIViewController {
 
     private enum Layout {
         static let menuRowHeight: CGFloat = 75
+        static let pickerColumns: CGFloat = 6
+        static let pickerSpacing: CGFloat = 5
+        static let colorPickerVerticalSectionInset: CGFloat = 8
     }
 
     private let kind: TrackerCreationKind
 
-    private let defaultEmoji = "🙂"
-    private let defaultColorAssetName = "Blue"
+    private let emojis = TrackerCreationPalette.emojis
+    private let colorAssetNames = TrackerCreationPalette.colorAssetNames
 
-    private let defaultCategoryTitle = "Домашний уют"
+    private static let categoryPlaceholder = "Выберите категорию"
 
+    private var categoryTitles: [String]
+    private var selectedCategoryTitle: String?
+
+    private var selectedEmojiIndex = 0
+    private var selectedColorIndex = 0
     private var selectedWeekdays = Set<Int>()
+
+    private var emojiGridHeightConstraint: NSLayoutConstraint?
+    private var colorGridHeightConstraint: NSLayoutConstraint?
+    private var didRefreshColorPickerAfterFirstLayout = false
 
     private let scrollView = UIScrollView()
     private let nameField = UITextField()
@@ -31,8 +43,14 @@ final class CreateTrackerViewController: UIViewController {
     private let cancelButton = UIButton(type: .system)
     private let createButton = UIButton(type: .system)
 
-    init(kind: TrackerCreationKind) {
+    private lazy var emojiCollectionView: UICollectionView = makePickerCollectionView(registerEmoji: true)
+
+    private lazy var colorCollectionView: UICollectionView = makePickerCollectionView(registerEmoji: false)
+
+    init(kind: TrackerCreationKind, existingCategoryTitles: [String]) {
         self.kind = kind
+        self.categoryTitles = Self.uniquePreservingOrder(existingCategoryTitles)
+        self.selectedCategoryTitle = self.categoryTitles.first
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -45,7 +63,7 @@ final class CreateTrackerViewController: UIViewController {
         super.viewDidLoad()
         view.backgroundColor = .systemBackground
         navigationItem.largeTitleDisplayMode = .never
-        title = kind == .habit ? "Новая привычка" : "Новое нерегулярное событие"
+        title = kind == .habit ? "Создание привычки" : "Новое нерегулярное событие"
 
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         scrollView.keyboardDismissMode = .interactive
@@ -62,6 +80,19 @@ final class CreateTrackerViewController: UIViewController {
 
         let menuCard = makeMenuCard()
         content.addArrangedSubview(menuCard)
+
+        content.addArrangedSubview(makeSectionTitle("Emoji"))
+        content.addArrangedSubview(emojiCollectionView)
+        let emojiH = emojiCollectionView.heightAnchor.constraint(equalToConstant: 160)
+        emojiH.isActive = true
+        emojiGridHeightConstraint = emojiH
+
+        content.addArrangedSubview(makeSectionTitle("Цвет"))
+        content.addArrangedSubview(colorCollectionView)
+        let colorH = colorCollectionView.heightAnchor.constraint(equalToConstant: 160)
+        colorH.isActive = true
+        colorGridHeightConstraint = colorH
+        colorCollectionView.clipsToBounds = false
 
         NSLayoutConstraint.activate([
             scrollView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
@@ -120,8 +151,27 @@ final class CreateTrackerViewController: UIViewController {
             object: nil
         )
 
+        selectedColorIndex = 0
         updateScheduleSummary()
         updateCreateButtonState()
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        let contentWidth = scrollView.bounds.width - 32
+        guard contentWidth > 0 else { return }
+        let emojiHeight = Self.pickerGridHeight(itemCount: emojis.count, contentWidth: contentWidth)
+        let colorHeight = Self.colorPickerGridHeight(itemCount: colorAssetNames.count, contentWidth: contentWidth)
+        emojiGridHeightConstraint?.constant = emojiHeight
+        colorGridHeightConstraint?.constant = colorHeight
+        emojiCollectionView.collectionViewLayout.invalidateLayout()
+        colorCollectionView.collectionViewLayout.invalidateLayout()
+
+        if !didRefreshColorPickerAfterFirstLayout, colorCollectionView.bounds.width > 0 {
+            didRefreshColorPickerAfterFirstLayout = true
+            selectedColorIndex = 0
+            colorCollectionView.reloadData()
+        }
     }
 
     deinit {
@@ -141,6 +191,89 @@ final class CreateTrackerViewController: UIViewController {
         nameField.rightViewMode = .always
     }
 
+    private func makePickerCollectionView(registerEmoji: Bool) -> UICollectionView {
+        let layout = UICollectionViewFlowLayout()
+        layout.minimumInteritemSpacing = Layout.pickerSpacing
+        layout.minimumLineSpacing = Layout.pickerSpacing
+        layout.sectionInset = .zero
+        let cv = UICollectionView(frame: .zero, collectionViewLayout: layout)
+        cv.backgroundColor = .clear
+        cv.isScrollEnabled = false
+        cv.dataSource = self
+        cv.delegate = self
+        if registerEmoji {
+            cv.register(EmojiPickerCollectionViewCell.self, forCellWithReuseIdentifier: EmojiPickerCollectionViewCell.reuseIdentifier)
+        } else {
+            cv.register(ColorPickerCollectionViewCell.self, forCellWithReuseIdentifier: ColorPickerCollectionViewCell.reuseIdentifier)
+        }
+        cv.translatesAutoresizingMaskIntoConstraints = false
+        return cv
+    }
+
+    private func makeSectionTitle(_ text: String) -> UIView {
+        let container = UIView()
+        container.translatesAutoresizingMaskIntoConstraints = false
+        let label = UILabel()
+        label.text = text
+        label.font = .systemFont(ofSize: 19, weight: .bold)
+        label.textColor = UIColor(named: "Black [day]")
+        label.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(label)
+        let screenEdgeInset: CGFloat = 28
+        let contentInset: CGFloat = 16
+        let labelInsetInContainer = screenEdgeInset - contentInset
+        NSLayoutConstraint.activate([
+            label.topAnchor.constraint(equalTo: container.topAnchor),
+            label.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            label.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: labelInsetInContainer),
+            label.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -labelInsetInContainer),
+        ])
+        return container
+    }
+
+    private static func pickerGridItemSide(contentWidth: CGFloat) -> CGFloat {
+        let columns = Layout.pickerColumns
+        let spacing = Layout.pickerSpacing
+        return floor((contentWidth - spacing * (columns - 1)) / columns)
+    }
+
+    private static func pickerGridHeight(itemCount: Int, contentWidth: CGFloat) -> CGFloat {
+        guard itemCount > 0 else { return 0 }
+        let columns = Layout.pickerColumns
+        let spacing = Layout.pickerSpacing
+        let side = pickerGridItemSide(contentWidth: contentWidth)
+        let rows = ceil(CGFloat(itemCount) / columns)
+        return rows * side + max(CGFloat(0), rows - 1) * spacing
+    }
+
+    private static func colorPickerCellSide(contentWidth: CGFloat) -> CGFloat {
+        let columns: CGFloat = Layout.pickerColumns
+        let gaps: CGFloat = Layout.pickerColumns - 1
+        let spacingMin: CGFloat = 2
+        let targetSide: CGFloat = ColorPickerCollectionViewCell.swatchSide + 2 * (3 + 2)
+        let spacingIfTarget = (contentWidth - columns * targetSide) / gaps
+        if spacingIfTarget >= spacingMin { return targetSide }
+        let side = floor((contentWidth - gaps * spacingMin) / columns)
+        return max(45, side)
+    }
+
+    private static func colorPickerInteritemSpacing(contentWidth: CGFloat) -> CGFloat {
+        let columns = Layout.pickerColumns
+        let gaps = Layout.pickerColumns - 1
+        let side = colorPickerCellSide(contentWidth: contentWidth)
+        return max(2, (contentWidth - columns * side) / gaps)
+    }
+
+    private static func colorPickerGridHeight(itemCount: Int, contentWidth: CGFloat) -> CGFloat {
+        guard itemCount > 0 else { return 0 }
+        let columns = Layout.pickerColumns
+        let side = colorPickerCellSide(contentWidth: contentWidth)
+        let spacing = colorPickerInteritemSpacing(contentWidth: contentWidth)
+        let rows = ceil(CGFloat(itemCount) / columns)
+        let grid = rows * side + max(CGFloat(0), rows - 1) * spacing
+        return grid + 2 * Layout.colorPickerVerticalSectionInset
+    }
+
     private func makeMenuCard() -> UIView {
         let container = UIView()
         container.backgroundColor = UIColor(named: "Light Gray")?.withAlphaComponent(0.6) ?? .secondarySystemFill
@@ -148,7 +281,7 @@ final class CreateTrackerViewController: UIViewController {
         container.layer.masksToBounds = true
         container.translatesAutoresizingMaskIntoConstraints = false
 
-        categoryDetailLabel.text = defaultCategoryTitle
+        updateCategoryDetailLabel()
         let categoryRow = makeChevronRow(title: "Категория", detailLabel: categoryDetailLabel)
         categoryRow.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(categoryTapped)))
 
@@ -264,7 +397,26 @@ final class CreateTrackerViewController: UIViewController {
         return row
     }
 
-    @objc private func categoryTapped() {}
+    @objc private func categoryTapped() {
+        let list = CategoryListViewController(titles: categoryTitles, selectedTitle: selectedCategoryTitle)
+        list.onCategoriesUpdate = { [weak self] titles, selected in
+            self?.categoryTitles = titles
+            self?.selectedCategoryTitle = selected
+            self?.updateCategoryDetailLabel()
+            self?.updateCreateButtonState()
+        }
+        navigationController?.pushViewController(list, animated: true)
+    }
+
+    private func updateCategoryDetailLabel() {
+        if let title = selectedCategoryTitle {
+            categoryDetailLabel.text = title
+            categoryDetailLabel.textColor = UIColor(named: "Gray")
+        } else {
+            categoryDetailLabel.text = Self.categoryPlaceholder
+            categoryDetailLabel.textColor = UIColor(named: "Gray")
+        }
+    }
 
     @objc private func scheduleTapped() {
         guard kind == .habit else { return }
@@ -359,7 +511,8 @@ final class CreateTrackerViewController: UIViewController {
     private func updateCreateButtonState() {
         let nameOk = !(nameField.text?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
         let scheduleOk = kind == .irregularEvent || !selectedWeekdays.isEmpty
-        let enabled = nameOk && scheduleOk
+        let categoryOk = selectedCategoryTitle != nil
+        let enabled = nameOk && scheduleOk && categoryOk
 
         var config = createButton.configuration ?? .filled()
         config.baseBackgroundColor = enabled ? UIColor(named: "Black [day]") : UIColor(named: "Gray")
@@ -380,18 +533,110 @@ final class CreateTrackerViewController: UIViewController {
             schedule = .irregularEvent
         }
 
+        guard let categoryTitle = selectedCategoryTitle else { return }
+
         let tracker = Tracker(
             id: UUID(),
             name: name,
-            colorAssetName: defaultColorAssetName,
-            emoji: defaultEmoji,
+            colorAssetName: colorAssetNames[selectedColorIndex],
+            emoji: emojis[selectedEmojiIndex],
             schedule: schedule
         )
-        onCreate?(tracker, defaultCategoryTitle)
+        onCreate?(tracker, categoryTitle)
         dismissCreation()
+    }
+
+    private static func uniquePreservingOrder(_ titles: [String]) -> [String] {
+        var seen = Set<String>()
+        var result: [String] = []
+        for t in titles {
+            let key = t.lowercased()
+            if seen.contains(key) { continue }
+            seen.insert(key)
+            result.append(t)
+        }
+        return result
     }
 
     private func dismissCreation() {
         dismiss(animated: true)
+    }
+}
+
+// MARK: - Emoji / color pickers
+
+extension CreateTrackerViewController: UICollectionViewDataSource, UICollectionViewDelegate, UICollectionViewDelegateFlowLayout {
+    func collectionView(_ collectionView: UICollectionView, numberOfItemsInSection section: Int) -> Int {
+        if collectionView === emojiCollectionView {
+            return emojis.count
+        }
+        return colorAssetNames.count
+    }
+
+    func collectionView(_ collectionView: UICollectionView, cellForItemAt indexPath: IndexPath) -> UICollectionViewCell {
+        if collectionView === emojiCollectionView {
+            let cell = collectionView.dequeueReusableCell(
+                withReuseIdentifier: EmojiPickerCollectionViewCell.reuseIdentifier,
+                for: indexPath
+            ) as! EmojiPickerCollectionViewCell
+            let side = Self.pickerGridItemSide(contentWidth: max(1, collectionView.bounds.width))
+            let fontSize = max(32, side * 0.42)
+            cell.configure(emoji: emojis[indexPath.item], fontSize: fontSize, isSelected: indexPath.item == selectedEmojiIndex)
+            return cell
+        }
+        let cell = collectionView.dequeueReusableCell(
+            withReuseIdentifier: ColorPickerCollectionViewCell.reuseIdentifier,
+            for: indexPath
+        ) as! ColorPickerCollectionViewCell
+        cell.configure(colorAssetName: colorAssetNames[indexPath.item], isSelected: indexPath.item == selectedColorIndex)
+        return cell
+    }
+
+    func collectionView(_ collectionView: UICollectionView, layout collectionViewLayout: UICollectionViewLayout, sizeForItemAt indexPath: IndexPath) -> CGSize {
+        let width = max(1, collectionView.bounds.width)
+        if collectionView === colorCollectionView {
+            let side = Self.colorPickerCellSide(contentWidth: width)
+            return CGSize(width: side, height: side)
+        }
+        let side = Self.pickerGridItemSide(contentWidth: width)
+        return CGSize(width: side, height: side)
+    }
+
+    func collectionView(_ collectionView: UICollectionView, layout collectionViewLayout: UICollectionViewLayout, minimumInteritemSpacingForSectionAt section: Int) -> CGFloat {
+        if collectionView === colorCollectionView {
+            return Self.colorPickerInteritemSpacing(contentWidth: max(1, collectionView.bounds.width))
+        }
+        return Layout.pickerSpacing
+    }
+
+    func collectionView(_ collectionView: UICollectionView, layout collectionViewLayout: UICollectionViewLayout, minimumLineSpacingForSectionAt section: Int) -> CGFloat {
+        if collectionView === colorCollectionView {
+            return Self.colorPickerInteritemSpacing(contentWidth: max(1, collectionView.bounds.width))
+        }
+        return Layout.pickerSpacing
+    }
+
+    func collectionView(_ collectionView: UICollectionView, layout collectionViewLayout: UICollectionViewLayout, insetForSectionAt section: Int) -> UIEdgeInsets {
+        if collectionView === colorCollectionView {
+            let v = Layout.colorPickerVerticalSectionInset
+            return UIEdgeInsets(top: v, left: 0, bottom: v, right: 0)
+        }
+        return .zero
+    }
+
+    func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {
+        if collectionView === emojiCollectionView {
+            let previous = selectedEmojiIndex
+            selectedEmojiIndex = indexPath.item
+            if previous != indexPath.item {
+                collectionView.reloadItems(at: [IndexPath(item: previous, section: 0), indexPath])
+            }
+        } else {
+            let previous = selectedColorIndex
+            selectedColorIndex = indexPath.item
+            if previous != indexPath.item {
+                collectionView.reloadData()
+            }
+        }
     }
 }
