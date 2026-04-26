@@ -8,6 +8,8 @@
 import UIKit
 
 class TrackerViewController: UIViewController, UICollectionViewDataSource, UICollectionViewDelegateFlowLayout, UISearchResultsUpdating {
+    private let dataStores: TrackerDataStores
+    private let persistChanges: () -> Void
     private let collectionView: UICollectionView
     private let searchController = UISearchController(searchResultsController: nil)
 
@@ -38,6 +40,8 @@ class TrackerViewController: UIViewController, UICollectionViewDataSource, UICol
 
     private var lastCollectionViewWidth: CGFloat = 0
 
+    private var storeReloadScheduled = false
+
     private var searchQuery: String {
         searchController.searchBar.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
@@ -64,26 +68,25 @@ class TrackerViewController: UIViewController, UICollectionViewDataSource, UICol
         return sections
     }
 
-    override init(nibName nibNameOrNil: String?, bundle nibBundleOrNil: Bundle?) {
+    init(dataStores: TrackerDataStores, persistChanges: @escaping () -> Void) {
+        self.dataStores = dataStores
+        self.persistChanges = persistChanges
         let layout = UICollectionViewFlowLayout()
         layout.minimumInteritemSpacing = 9
         layout.minimumLineSpacing = 9
         layout.sectionInset = UIEdgeInsets(top: 8, left: 16, bottom: 16, right: 16)
         collectionView = UICollectionView(frame: .zero, collectionViewLayout: layout)
-        super.init(nibName: nibNameOrNil, bundle: nibBundleOrNil)
+        super.init(nibName: nil, bundle: nil)
     }
 
     required init?(coder: NSCoder) {
-        let layout = UICollectionViewFlowLayout()
-        layout.minimumInteritemSpacing = 9
-        layout.minimumLineSpacing = 9
-        layout.sectionInset = UIEdgeInsets(top: 8, left: 16, bottom: 16, right: 16)
-        collectionView = UICollectionView(frame: .zero, collectionViewLayout: layout)
-        super.init(coder: coder)
+        fatalError("init(coder:) has not been implemented")
     }
 
     override func viewDidLoad() {
         super.viewDidLoad()
+        reloadFromStores()
+        bindStoreObservers()
         view.backgroundColor = UIColor(named: "White [day]")
 
         navigationItem.largeTitleDisplayMode = .always
@@ -125,6 +128,33 @@ class TrackerViewController: UIViewController, UICollectionViewDataSource, UICol
         datePicker.date = currentDate
         refreshCompletedIdsForSelectedDate()
         updateUI()
+    }
+
+    private func reloadFromStores() {
+        categories = dataStores.categoryStore.fetchCategoriesWithTrackers()
+        completedTrackers = dataStores.recordStore.fetchAll()
+    }
+
+    private func bindStoreObservers() {
+        let schedule: () -> Void = { [weak self] in
+            guard let self else { return }
+            self.scheduleReloadFromStores()
+        }
+        dataStores.categoryStore.onChange = schedule
+        dataStores.trackerStore.onChange = schedule
+        dataStores.recordStore.onChange = schedule
+    }
+
+    private func scheduleReloadFromStores() {
+        guard !storeReloadScheduled else { return }
+        storeReloadScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.storeReloadScheduled = false
+            self.reloadFromStores()
+            self.refreshCompletedIdsForSelectedDate()
+            self.updateUI()
+        }
     }
 
     override func viewDidLayoutSubviews() {
@@ -181,16 +211,19 @@ class TrackerViewController: UIViewController, UICollectionViewDataSource, UICol
     private func toggleCompletion(for tracker: Tracker) {
         guard !isFutureSelectedDate() else { return }
         let day = selectedDateStartOfDay
-        if completedTrackerIdsForSelectedDate.contains(tracker.id) {
-            completedTrackers.removeAll {
-                $0.trackerId == tracker.id && calendar.isDate($0.date, inSameDayAs: day)
-            }
-            completedTrackerIdsForSelectedDate.remove(tracker.id)
-        } else {
-            completedTrackers.append(TrackerRecord(trackerId: tracker.id, date: day))
-            completedTrackerIdsForSelectedDate.insert(tracker.id)
+        let isCompletedNow = completedTrackerIdsForSelectedDate.contains(tracker.id)
+        do {
+            try dataStores.recordStore.setCompleted(
+                trackerId: tracker.id,
+                on: day,
+                completed: !isCompletedNow,
+                calendar: calendar,
+                trackerStore: dataStores.trackerStore
+            )
+            persistChanges()
+        } catch {
+            assertionFailure(String(describing: error))
         }
-        updateUI()
     }
 
     private func makeEmptyStateView() -> UIView {
@@ -301,8 +334,9 @@ class TrackerViewController: UIViewController, UICollectionViewDataSource, UICol
         let choose = ChooseTrackerKindViewController()
         let nav = UINavigationController(rootViewController: choose)
 
-        choose.onKindSelected = { [weak choose] kind in
-            let create = CreateTrackerViewController(kind: kind)
+        choose.onKindSelected = { [weak self, weak choose] kind in
+            let titles = self?.categories.map(\.title) ?? []
+            let create = CreateTrackerViewController(kind: kind, existingCategoryTitles: titles)
             create.onCreate = { [weak self] tracker, categoryTitle in
                 self?.appendTracker(tracker, categoryTitle: categoryTitle)
             }
@@ -313,12 +347,11 @@ class TrackerViewController: UIViewController, UICollectionViewDataSource, UICol
     }
 
     private func appendTracker(_ tracker: Tracker, categoryTitle: String) {
-        if let index = categories.firstIndex(where: { $0.title == categoryTitle }) {
-            let category = categories[index]
-            categories[index] = TrackerCategory(title: category.title, trackers: category.trackers + [tracker])
-        } else {
-            categories.append(TrackerCategory(title: categoryTitle, trackers: [tracker]))
+        do {
+            try dataStores.trackerStore.insert(tracker, categoryTitle: categoryTitle, categoryStore: dataStores.categoryStore)
+            persistChanges()
+        } catch {
+            assertionFailure(String(describing: error))
         }
-        updateUI()
     }
 }
